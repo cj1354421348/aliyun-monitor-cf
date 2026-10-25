@@ -28,8 +28,14 @@ import { MemoryBackend, State, STATE_KEY, type StateBackend } from './state.ts';
 import { createLogger, redact, sanitizeMd, type Logger } from './util.ts';
 
 export interface Env {
-  /** KV 命名空间绑定，必须叫 MONITOR_KV */
-  MONITOR_KV: KVNamespace;
+  /**
+   * KV 命名空间绑定，名字必须叫 MONITOR_KV。
+   *
+   * 类型上标成可选，是因为它可能真的不在 —— 比如在 Dashboard 上还没绑、
+   * 或者绑错了名字。那种情况下 loadConfig 回落 CONFIG_JSON、状态退回内存，
+   * Worker 不会崩，只是冷却机制失效（见 makeContext 里的注释）。
+   */
+  MONITOR_KV?: KVNamespace;
   /** HTTP 触发的 Bearer token；不设则 HTTP 触发一律拒绝 */
   MONITOR_SECRET?: string;
   /** 配置 JSON 兜底（不推荐，超过 5KB 会截断） */
@@ -53,13 +59,34 @@ class KvBackend implements StateBackend {
   }
 }
 
+/**
+ * 没有 KV binding 时的降级后端。
+ *
+ * 内存后端每次调用都是空的，State.save() 会以为状态读失败（readable=false）
+ * 从而拒绝写入 —— 结果就是冷却时间戳存不下来，同一条告警每 5 分钟重复一次。
+ * 巡检 / 止损 / 日报本身照常工作，因为那些不需要跨调用状态。
+ * 这是个降级路径，不是正常路径：日志里会明确警告。
+ */
+function backendFor(env: Env, log: Logger): StateBackend {
+  if (env.MONITOR_KV) return new KvBackend(env.MONITOR_KV);
+  log.warn(
+    '没有 MONITOR_KV 绑定 —— 状态改用内存后端，冷却机制会失效（告警会重复推送）。' +
+      '去 Dashboard → Settings → Variables and Secrets 加一个 KV Namespace Binding，变量名必须叫 MONITOR_KV',
+  );
+  return new MemoryBackend();
+}
+
 export async function loadConfig(env: Env): Promise<AppConfig> {
-  const fromKv = await env.MONITOR_KV.get(CONFIG_KEY, 'text');
+  const fromKv = env.MONITOR_KV ? await env.MONITOR_KV.get(CONFIG_KEY, 'text') : null;
   const raw = fromKv ?? env.CONFIG_JSON ?? '';
   if (!raw.trim()) {
     throw new Error(
-      `KV 里没有 \`${CONFIG_KEY}\`，也没设 CONFIG_JSON —— ` +
-        '先用 wrangler kv key put 写入配置（见 src/cf/README.md）',
+      env.MONITOR_KV
+        ? `KV 里没有 \`${CONFIG_KEY}\`，也没设 CONFIG_JSON —— ` +
+            '先在 Dashboard 的 KV Pairs 里写入配置，或用 wrangler kv key put'
+        : `没有 MONITOR_KV 绑定，也没设 CONFIG_JSON —— ` +
+            '去 Dashboard → Settings → Variables and Secrets 加一个 KV Namespace Binding，' +
+            '变量名必须叫 MONITOR_KV',
     );
   }
   try {
@@ -83,7 +110,7 @@ async function makeContext(options: RunOptions): Promise<{
   state: State;
 }> {
   const config = await loadConfig(options.env);
-  const backend = options.backend ?? new KvBackend(options.env.MONITOR_KV);
+  const backend = options.backend ?? backendFor(options.env, options.log);
   const state = new State(
     backend,
     options.env.STATE_KEY?.trim() || STATE_KEY,

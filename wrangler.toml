@@ -14,10 +14,30 @@ compatibility_date = "2025-01-15"
 [triggers]
 crons = ["*/5 * * * *"]
 
-# 状态存储：KV 免费额度 1GB / 10万读 / 1千写每天，够用
-[[kv_namespaces]]
-binding = "MONITOR_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+# ================================================================
+# KV 绑定：不在本文件里声明，改由 Dashboard 手工绑定
+# ================================================================
+#
+# 仓库是公开的，不想把 KV namespace id 写进 Git。做法：
+#   Dashboard → 你的 Worker → Settings → Variables and Secrets
+#   → KV Namespace Bindings → Add binding
+#     Variable name : MONITOR_KV      ← 必须叫这个，代码里写死了
+#     KV namespace  : 选你建好的那个   ← 名字任意，id 在下面
+#
+# 但有个坑必须绕过：wrangler 部署时会用它自己的 binding 集合覆盖远端，
+# 没在配置里声明的 KV 会被清掉。wrangler 内部只会把
+# plain_text / json / secret_text / secret_key 放进 keep_bindings，
+# 从来不包含 kv_namespace。
+#
+# 所以这里用 unsafe.metadata 硬塞一个 keep_bindings。
+# wrangler 在拼完 metadata 之后会用 unsafe.metadata 的 key 覆盖同名项
+# （见 wrangler-dist/cli.js:105166-105168），所以这个数组是最终值：
+#   kv_namespace  → 保留 Dashboard 上手工绑的 KV
+#   secret_text / secret_key → 保留 Worker Secret（MONITOR_SECRET 等）
+#
+# 副作用：每次部署会打一条 unsafe 是实验性字段的警告，不影响部署。
+[unsafe.metadata]
+keep_bindings = ["kv_namespace", "secret_text", "secret_key"]
 
 [vars]
 # 子请求预算。免费版单次调用上限 50 个子请求，留 10 个余量给告警推送

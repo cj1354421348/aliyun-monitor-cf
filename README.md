@@ -25,28 +25,85 @@ Telegram 命令：`/help` `/list` `/status` `/report` `/selftest`（只读，不
 
 ---
 
-## 快速开始
+## 快速开始（网页部署）
+
+全程不碰本地 wrangler，四步。
+
+**1. 建 KV 命名空间**
+
+Dashboard → Storage & Databases → Workers KV → Create instance。
+名字随便起，建完记下那串 32 位十六进制 ID。
+
+**2. 写配置**
+
+进刚建的 KV → KV Pairs → Add entry：
+
+| Key | Value |
+| --- | --- |
+| `config` | 整份配置 JSON（见下面「配置」一节） |
+
+**3. 建 Worker 并连仓库**
+
+Dashboard → Workers & Pages → Create → Workers → Hello World。
+**Worker name 必须填 `aliyun-monitor`**，它要和 `wrangler.toml` 里的 `name` 一致。
+
+建好后进 Settings → Build → Connect，选 GitHub 仓库、Production branch 填 `main`。
+Build command 留空，Deploy command 保持默认的 `npx wrangler deploy`。
+
+**4. 绑 KV**
+
+同一个 Worker → Settings → Variables and Secrets → KV Namespace Bindings → Add binding：
+
+| 字段 | 值 |
+| --- | --- |
+| Variable name | `MONITOR_KV` ← 必须叫这个，代码里写死了 |
+| KV namespace | 第 1 步建的那个 |
+
+绑完回 Deployments 点 Retry deployment。
+
+### 为什么 KV 不在 wrangler.toml 里声明
+
+仓库是公开的，KV namespace ID 虽然不算密钥，但没必要进 Git。
+`wrangler.toml` 里用 `[unsafe.metadata]` 塞了一个 `keep_bindings`：
+
+```toml
+[unsafe.metadata]
+keep_bindings = ["kv_namespace", "secret_text", "secret_key"]
+```
+
+没有这一行，wrangler 部署时会用自己算的 binding 集合覆盖远端，
+Dashboard 上手工绑的 KV 会被清掉 —— wrangler 内部的 `keep_bindings`
+只认 `plain_text` / `json` / `secret_text` / `secret_key`，从不包含 `kv_namespace`。
+`unsafe.metadata` 是唯一能在配置层覆盖它的口子（见 wrangler-dist `cli.js:105166`）。
+
+代价是每次部署会打一条 `"unsafe" fields are experimental` 警告，不影响部署。
+
+### 可选：HTTP 触发和 Telegram 命令
+
+不加 `MONITOR_SECRET` 也能跑 —— cron 巡检、止损、日报、告警全部正常，
+因为告警是直接调 `api.telegram.org` 推送的，不经过 webhook。
+
+想手动触发或让机器人在群里回话，才需要：
+
+```bash
+npx wrangler secret put MONITOR_SECRET
+# 然后绑 webhook
+curl "https://api.telegram.org/bot<bot_token>/setWebhook?url=https://<worker>.workers.dev/tg/<MONITOR_SECRET>"
+```
+
+### 或者用 CLI 部署
 
 ```bash
 npm install
 npx wrangler login
-
-# 1. 建 KV
-npx wrangler kv namespace create MONITOR_KV
-#    把输出的 id 填进 wrangler.toml 的 [[kv_namespaces]]
-
-# 2. 填配置
-cp config.example.json config.json   # 填真 AK / bot_token / instance_id
-
-# 3. 配置进 KV（改配置不用重新 deploy）
+npx wrangler kv namespace create MONITOR_KV    # 记下 id
 npx wrangler kv key put config --path ./config.json --binding MONITOR_KV
-
-# 4. HTTP 触发密钥
-npx wrangler secret put MONITOR_SECRET
-
-# 5. 部署
+npx wrangler secret put MONITOR_SECRET         # 可选
 npx wrangler deploy
 ```
+
+CLI 这条路要在 `wrangler.toml` 里补回 `[[kv_namespaces]]` 段（带真实 ID），
+否则部署后没有 KV 绑定 —— 状态会退回内存，冷却失效。
 
 > **wrangler 3 默认写远端**，`--local` 才是本地模拟；wrangler 4 反过来，要加 `--remote`。
 > 不确定就先 `npx wrangler --version`。
@@ -251,8 +308,11 @@ npm test            # 84 个用例
 
 ## 排障
 
+**`没有 MONITOR_KV 绑定，也没设 CONFIG_JSON`**
+→ Dashboard → Settings → Variables and Secrets 里没绑 KV，或变量名不叫 `MONITOR_KV`。
+
 **`KV 里没有 config`**
-→ 配置没写进去，或写到了本地模拟 KV。
+→ 配置没写进去，或写到了本地模拟 KV。Dashboard 的 KV Pairs 里 Key 必须是 `config`。
 
 **`SignatureDoesNotMatch`**
 → `sk` 复制时带了换行或空格。
@@ -275,6 +335,8 @@ npm test            # 84 个用例
 **告警重复轰炸**
 → 状态没写进 KV。看 `wrangler tail` 里的 `state_saved: false`，
 通常是 `load()` 失败过，此时 `save()` 主动拒写。
+如果日志里有 `没有 MONITOR_KV 绑定 —— 状态改用内存后端`，那是 KV 没绑上，
+每次调用内存都是空的，冷却时间戳存不住，同一条告警每 5 分钟重复一次。
 
 ---
 
