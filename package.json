@@ -1,0 +1,20 @@
+{
+  "name": "aliyun-monitor-cf",
+  "version": "1.0.0",
+  "private": true,
+  "description": "阿里云 CDT 流量监控 / 止损 / 日报 —— Cloudflare Workers 版",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.99.0"
+  }
+}

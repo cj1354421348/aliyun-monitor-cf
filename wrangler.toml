@@ -1,0 +1,27 @@
+# Cloudflare Workers 配置
+#
+# 只挂一个 cron 表达式 —— 免费版每个账号只有 5 个 trigger 配额，
+# 而止损 / 开机 / 日报三件事可以共用同一个 5 分钟 tick，
+# 由 src/scheduler.ts 按北京时间分发。详见那个文件的注释。
+#
+# 表达式本身是 UTC，但 `*/5 * * * *` 在任何时区都等价，所以不用换算。
+
+name = "aliyun-monitor"
+main = "src/index.ts"
+compatibility_date = "2025-01-15"
+
+# 免费版 cron 是最终一致的，实际触发可能延迟几分钟 —— 止损场景可以接受
+[triggers]
+crons = ["*/5 * * * *"]
+
+# 状态存储：KV 免费额度 1GB / 10万读 / 1千写每天，够用
+[[kv_namespaces]]
+binding = "MONITOR_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+# 子请求预算。免费版单次调用上限 50 个子请求，留 10 个余量给告警推送
+SUBREQUEST_BUDGET = "40"
+
+[observability]
+enabled = true

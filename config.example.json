@@ -1,0 +1,36 @@
+{
+  "telegram": {
+    "bot_token": "123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "chat_id": "-1001234567890",
+    "admin_user_ids": [123456789]
+  },
+  "bark": {
+    "bark_url": "https://api.day.app/YOUR_BARK_KEY"
+  },
+  "usd_cny_rate": 7.2,
+  "schedule": {
+    "auto_start": true,
+    "start_at_minutes": [0, 30],
+    "report_at": "09:00",
+    "report_weekdays": [0, 1, 2, 3, 4, 5, 6]
+  },
+  "users": [
+    {
+      "name": "hk-01",
+      "instance_id": "i-bp1xxxxxxxxxxxxxxxx",
+      "region": "cn-hongkong",
+      "traffic_limit": 180,
+      "bill_threshold": 1.0,
+      "bill_endpoint": "business.ap-southeast-1.aliyuncs.com",
+      "ak": "LTAI5tXXXXXXXXXXXXXXXX",
+      "sk": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    },
+    {
+      "name": "sg-02",
+      "instance_id": "i-bp2yyyyyyyyyyyyyyyy",
+      "region": "ap-southeast-1",
+      "traffic_limit": 180,
+      "paused": true
+    }
+  ]
+}
