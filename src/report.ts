@@ -1,13 +1,18 @@
 /**
  * 每日财报。
  *
- * 格式沿用 src/fc/index.py 的 run_report / build_user_report，
- * 连缩进和 emoji 都保持一致 —— 这样从 FC 切过来时，历史消息能对上。
+ * 版式对齐用户旧版 FC 脚本的观感：一条实例一段，字段左对齐缩进三格，
+ * 每个字段前面一个 emoji，扫一眼就能找到想看的那行。
+ *
+ * 关键设计：所有数据先查完再渲染。因为实例名后面要跟规格 (2C0.5G)，
+ * 而规格来自 describeInstance —— 边查边拼的话，标题得写在规格之前，
+ * 就只能把标题塞到后面再回填，反而更绕。
  */
 
 import {
   describeInstance,
   ecsAction,
+  fetchAccountBill,
   fetchBill,
   fetchTrafficGb,
   probeBill,
@@ -29,6 +34,9 @@ export interface ReportOutcome {
 /**
  * 给这一行一句话结论，扫一眼就知道要不要管。
  * 优先级：流量超标 > 流量接近上限 > 扣费超过阈值 > 正常。
+ *
+ * 返回的是「评价」行的值，所以正常时只有一个 ✅，异常时才补一句原因 ——
+ * 天天都看「评估: ✅ 正常」会让人习惯性忽略这一行，真出事时反而漏掉。
  */
 export function evaluate(
   trafficGb: number | null,
@@ -38,15 +46,15 @@ export function evaluate(
   user: UserConfig,
   rate: number,
 ): string {
-  if (trafficGb !== null && trafficGb >= limit) return '评估: ❌ 流量已超标，保持关机';
-  if (trafficGb !== null && limit && trafficGb / limit >= 0.9) return '评估: ⚠️ 流量接近上限';
+  if (trafficGb !== null && trafficGb >= limit) return '❌ 流量已超标，保持关机';
+  if (trafficGb !== null && limit && trafficGb / limit >= 0.9) return '⚠️ 流量接近上限';
 
   let billLimit = num(user.bill_threshold, 1.0);
   if (billCurrency === 'CNY') billLimit *= rate;
   if (billAmount !== null && billAmount > billLimit) {
-    return `评估: ⚠️ 扣费超过 ${billLimit.toFixed(2)} ${billCurrency || ''}`;
+    return `⚠️ 扣费超过 ${billLimit.toFixed(2)} ${billCurrency || ''}`.trim();
   }
-  return '评估: ✅ 正常';
+  return '✅';
 }
 
 /** 内存按 GB 展示：整 GB 不显示小数，避免出现 "4.0 GB" 这种别扭写法 */
@@ -56,26 +64,54 @@ function formatMemoryGb(memory: unknown): string {
   return value % 1 === 0 ? String(value) : value.toFixed(1);
 }
 
+/** 货币符号：认识的用符号，不认识的退回 "0.44 USD" */
+function money(amount: number | null, currency: string, digits = 2): string {
+  if (amount === null) return 'Fail';
+  const symbol = currency === 'USD' ? '$' : currency === 'CNY' ? '¥' : '';
+  if (!symbol) return `${amount.toFixed(digits)}${currency ? ' ' + currency : ''}`;
+  return `${symbol}${amount.toFixed(digits)}`;
+}
+
+/** 实例规格，拼成 2C0.5G；拿不到就返回空串，标题里不显示括号 */
+function specText(instance: { Cpu?: unknown; Memory?: unknown } | null): string {
+  if (!instance) return '';
+  const cpu = num(instance.Cpu);
+  const mem = formatMemoryGb(instance.Memory);
+  if (!cpu || mem === '-') return '';
+  return `${cpu}C${mem}G`;
+}
+
+function statusIcon(status: string | null): string {
+  if (status === null) return '⚪';
+  if (status === 'Running') return '🟢';
+  if (status === 'Stopped') return '🔴';
+  return '🟡';
+}
+
 async function buildUserReport(
   ctx: TickContext,
   user: UserConfig,
-  balanceCache: Map<string, { amount: number | null; currency: string }>,
+  caches: {
+    balance: Map<string, { amount: number | null; currency: string }>;
+    accountBill: Map<string, { amount: number | null; currency: string }>;
+  },
   rate: number,
 ): Promise<string[]> {
   const targetId = (user.instance_id ?? '').trim();
   const name = (user.name ?? '').trim() || targetId || 'Unknown_Device';
 
   if (user.paused || user.disabled) {
-    return [`【${sanitizeMd(name)}】`, '  状态: ⏸️ 监控已暂停', ''];
+    return [`👤 ${sanitizeMd(name)}`, '   ⏸️ 监控已暂停', ''];
   }
 
-  const lines: string[] = [`【${sanitizeMd(name)}】`];
   const limit = trafficLimit(user);
   const creds = credsFor(ctx.config, user);
 
+  // ── 查数据 ────────────────────────────────────────────────
   let trafficGb: number | null = null;
+  let trafficNote = '';
   if (!ctx.budget.take(1)) {
-    lines.push('  流量: 跳过（子请求预算不足）');
+    trafficNote = '跳过（子请求预算不足）';
   } else {
     try {
       const traffic = await withRetry(
@@ -86,73 +122,87 @@ async function buildUserReport(
         ctx.log,
       );
       trafficGb = traffic.gb;
-      const percent = limit ? (traffic.gb / limit) * 100 : 0;
-      lines.push(
-        `  流量: ${traffic.gb.toFixed(2)} GB / ${limit} GB (${percent.toFixed(1)}%)  ` +
-          `[明细 ${traffic.detailCount} 条]`,
-      );
-      if (percent >= 90) lines.push('  ⚠️ 流量接近上限，马上要触发止损关机');
     } catch (error) {
-      lines.push(`  流量: 查询失败 (${sanitizeMd(redact(error)).slice(0, 80)})`);
+      trafficNote = `查询失败 (${sanitizeMd(redact(error)).slice(0, 60)})`;
     }
   }
 
+  let instance: Awaited<ReturnType<typeof describeInstance>> = null;
+  let statusNote = '';
   if (!ctx.budget.take(1)) {
-    lines.push('  状态: 跳过（子请求预算不足）');
+    statusNote = '跳过（子请求预算不足）';
   } else {
     try {
-      const instance = await describeInstance(creds, user, { log: ctx.log });
-      if (instance === null) {
-        lines.push('  状态: 未找到实例');
-      } else {
-        const status = instance.Status ?? 'Unknown';
-        const icon = status === 'Running' ? '🟢' : status === 'Stopped' ? '🔴' : '🟡';
-        const addresses =
-          instance.PublicIpAddress?.IpAddress ?? instance.InnerIpAddress?.IpAddress ?? ['-'];
-        lines.push(`  状态: ${icon} ${status}`);
-        lines.push(`  IP: ${addresses[0] ?? '-'}`);
-        lines.push(
-          `  规格: ${instance.InstanceType ?? '-'} / ${instance.Cpu ?? '-'} 核 ` +
-            `${formatMemoryGb(instance.Memory)} GB`,
-        );
-      }
+      instance = await describeInstance(creds, user, { log: ctx.log });
+      if (instance === null) statusNote = '未找到实例';
     } catch (error) {
-      lines.push(`  状态: 查询失败 (${sanitizeMd(redact(error)).slice(0, 80)})`);
+      statusNote = `查询失败 (${sanitizeMd(redact(error)).slice(0, 60)})`;
     }
   }
 
   let billAmount: number | null = null;
   let billCurrency = '';
+  let billNote = '';
   if (ctx.budget.take(1)) {
     const bill = await fetchBill(creds, user, targetId, beijingMonth(), { log: ctx.log });
     billAmount = bill.amount;
     billCurrency = bill.currency;
-    if (bill.amount === null) {
-      lines.push('  账单: Fail');
-    } else {
-      const scope = bill.scope === '账号总览' ? ' (账号总览)' : '';
-      lines.push(`  账单: ${bill.amount.toFixed(4)} ${bill.currency}${scope}`);
-    }
   } else {
-    lines.push('  账单: 跳过（子请求预算不足）');
+    billNote = '跳过（子请求预算不足）';
   }
 
-  // 同一份 AK 的余额只查一次，多实例共用一个账号时能省一半子请求
+  // 账号总账、余额都是账号级数据，同一份 AK 只查一次
   const cacheKey = creds.ak;
-  if (!balanceCache.has(cacheKey)) {
+  if (!caches.accountBill.has(cacheKey)) {
     if (ctx.budget.take(1)) {
-      balanceCache.set(cacheKey, await queryBalance(creds, user, { log: ctx.log }));
+      caches.accountBill.set(
+        cacheKey,
+        await fetchAccountBill(creds, user, beijingMonth(), { log: ctx.log }),
+      );
     } else {
-      balanceCache.set(cacheKey, { amount: null, currency: '' });
+      caches.accountBill.set(cacheKey, { amount: null, currency: '' });
     }
   }
-  const balance = balanceCache.get(cacheKey)!;
+  if (!caches.balance.has(cacheKey)) {
+    if (ctx.budget.take(1)) {
+      caches.balance.set(cacheKey, await queryBalance(creds, user, { log: ctx.log }));
+    } else {
+      caches.balance.set(cacheKey, { amount: null, currency: '' });
+    }
+  }
+  const accountBill = caches.accountBill.get(cacheKey)!;
+  const balance = caches.balance.get(cacheKey)!;
+
+  // ── 渲染 ──────────────────────────────────────────────────
+  const spec = specText(instance);
+  const lines: string[] = [`👤 ${sanitizeMd(name)}${spec ? ` (${spec})` : ''}`];
+
   lines.push(
-    '  余额: ' +
-      (balance.amount === null ? 'Fail' : `${balance.amount.toFixed(2)} ${balance.currency}`),
+    `   🖥️ 状态: ${statusNote ? sanitizeMd(statusNote) : `${statusIcon(instance?.Status ?? null)} ${instance?.Status ?? 'Unknown'}`}`,
   );
 
-  lines.push('  ' + evaluate(trafficGb, limit, billAmount, billCurrency, user, rate));
+  if (instance) {
+    const addresses = instance.PublicIpAddress?.IpAddress ?? instance.InnerIpAddress?.IpAddress ?? [];
+    lines.push(`   🌐 IP: ${addresses[0] ?? '-'}`);
+  }
+
+  if (trafficNote) {
+    lines.push(`   📉 流量: ${sanitizeMd(trafficNote)}`);
+  } else if (trafficGb !== null) {
+    const percent = limit ? (trafficGb / limit) * 100 : 0;
+    lines.push(`   📉 流量: ${trafficGb.toFixed(2)} GB (${percent.toFixed(1)}%)`);
+  }
+
+  lines.push(
+    billNote
+      ? `   💰 实例账单: ${sanitizeMd(billNote)}`
+      : `   💰 实例账单: ${money(billAmount, billCurrency, 2)}`,
+  );
+  lines.push(`   📊 账户总账: ${money(accountBill.amount, accountBill.currency, 2)}`);
+  lines.push(`   💳 余额: ${money(balance.amount, balance.currency, 2)}`);
+  lines.push(
+    `   📝 评价: ${sanitizeMd(evaluate(trafficGb, limit, billAmount, billCurrency, user, rate))}`,
+  );
   lines.push('');
   return lines;
 }
@@ -160,15 +210,22 @@ async function buildUserReport(
 export async function runReport(ctx: TickContext): Promise<ReportOutcome> {
   const users = ctx.config.users ?? [];
   const rate = usdCnyRate(ctx.config);
-  const balanceCache = new Map<string, { amount: number | null; currency: string }>();
+  const caches = {
+    balance: new Map<string, { amount: number | null; currency: string }>(),
+    accountBill: new Map<string, { amount: number | null; currency: string }>(),
+  };
 
-  const lines: string[] = ['📊 阿里云多账号 - 每日财报', `日期: ${beijingDate(ctx.now())}`, ''];
+  const lines: string[] = [
+    '📊 [阿里云多账号 - 每日财报]',
+    `📅 日期: ${beijingDate(ctx.now())}`,
+    '',
+  ];
   for (const user of users) {
     try {
-      lines.push(...(await buildUserReport(ctx, user, balanceCache, rate)));
+      lines.push(...(await buildUserReport(ctx, user, caches, rate)));
     } catch (error) {
       lines.push(
-        `【${sanitizeMd(user.name || 'Unknown')}】生成失败: ` +
+        `👤 ${sanitizeMd(user.name || 'Unknown')} 生成失败: ` +
           `${sanitizeMd(redact(error)).slice(0, 120)}`,
       );
       lines.push('');
@@ -188,6 +245,7 @@ export async function runReport(ctx: TickContext): Promise<ReportOutcome> {
  * 这几个字段就是部署时的照妖镜：签名对不对、域名选对没有、
  * AK 权限够不够，一次全暴露。
  */
+
 export async function runSelftest(
   ctx: TickContext,
 ): Promise<{ mode: string; elapsed: number; result: Record<string, unknown> }> {

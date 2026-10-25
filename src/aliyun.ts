@@ -405,6 +405,35 @@ export async function fetchBill(
 }
 
 /**
+ * 账号级本月总账（QueryBillOverview）。
+ *
+ * 和 fetchBill 的实例账单是两个口径：实例账单只算这一台机器，
+ * 总账是整个账号（含所有产品）。日报里两行分开列，避免看的人
+ * 以为数字对不上是 bug。
+ */
+export async function fetchAccountBill(
+  creds: Credentials,
+  user: { bill_endpoint?: string },
+  billingCycle: string,
+  options: { log?: Logger } = {},
+): Promise<BalanceResult> {
+  for (const endpoint of bssEndpoints(user)) {
+    const data = await bssCall<{ Success?: boolean; Data?: { Items?: BillItem[] } }>(
+      creds,
+      endpoint,
+      'QueryBillOverview',
+      { BillingCycle: billingCycle },
+      options.log,
+    );
+    if (!data?.Success) continue;
+    const first = (data.Data?.Items ?? [])[0];
+    if (!first) continue;
+    return { amount: num(first.PretaxAmount), currency: first.Currency ?? '' };
+  }
+  return { amount: null, currency: '' };
+}
+
+/**
  * 探测这个账号该用哪个账单站点、哪个接口能用。
  * 这就是 400 NotApplicable 的照妖镜。
  */
