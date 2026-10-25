@@ -644,6 +644,15 @@ export function dashboardHtml(): string {
   var $ = function (id) { return document.getElementById(id); };
   var state = { summary: null };
 
+  // 任何未捕获的脚本错误都摊到结果区，省得「点了没反应」查不出原因
+  window.addEventListener('error', function (event) {
+    var out = $('out');
+    if (!out) return;
+    out.hidden = false;
+    out.className = 'err';
+    out.textContent = '页面脚本出错: ' + ((event && event.message) || '未知错误');
+  });
+
   function api(path, options) {
     options = options || {};
     options.credentials = 'same-origin';
@@ -800,14 +809,39 @@ export function dashboardHtml(): string {
     });
   }
 
+  // 发日报会真的往 Telegram 推一条消息，需要二次确认。
+  // 刻意不用 window.confirm：浏览器把模态框拦掉时它直接返回 false，
+  // 表现就是「点了没反应」，连提示都不给。改成页内两次点击，可控可撤销。
+  var pending = { mode: null, button: null, label: '', timer: null };
+
+  function clearPending() {
+    if (pending.timer) clearTimeout(pending.timer);
+    if (pending.button) {
+      pending.button.textContent = pending.label;
+      pending.button.classList.remove('primary');
+    }
+    pending = { mode: null, button: null, label: '', timer: null };
+  }
+
   function runMode(mode, button) {
-    if (mode === 'report' && !confirm('会真的往 Telegram 发一条日报，确定？')) return;
+    if (mode === 'report' && pending.mode !== 'report') {
+      pending.mode = 'report';
+      pending.button = button;
+      pending.label = button.textContent;
+      button.textContent = '再点一次确认';
+      button.classList.add('primary');
+      pending.timer = setTimeout(clearPending, 6000);
+      return;
+    }
+    clearPending();
+
     var out = $('out');
     var buttons = document.querySelectorAll('[data-mode]');
     Array.prototype.forEach.call(buttons, function (node) { node.disabled = true; });
     out.hidden = false;
     out.className = '';
     out.textContent = '执行中…';
+    if (out.scrollIntoView) out.scrollIntoView({ block: 'nearest' });
     api('/api/run?mode=' + encodeURIComponent(mode), { method: 'POST' })
       .then(function (result) {
         out.className = result.status === 200 ? 'ok' : 'err';
