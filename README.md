@@ -61,6 +61,80 @@ Build command 留空，Deploy command 保持默认的 `npx wrangler deploy`。
 
 绑完回 Deployments 点 Retry deployment。
 
+**5.（可选）开网页看板**
+
+同一个 Worker → Settings → Variables and Secrets → Add，两个都用 **Secret** 类型：
+
+| Name | Value |
+| --- | --- |
+| `DASHBOARD_USER` | 你想用的用户名 |
+| `DASHBOARD_PASS` | 你想用的密码，越长越好 |
+
+加完直接访问 Worker 根路径 `/` 就能登录看板。**不加这两个变量也不影响任何功能**——
+cron 巡检、止损、日报、Telegram 告警全部照常，只是访问 `/` 会返回一页 503 说明怎么配。
+
+### 网页看板
+
+根路径 `/` 是一张单页看板，不用装任何东西，手机上也能看。
+
+**能做什么**
+
+- 看每台实例的实时状态：运行状态、公网 IP、规格、流量进度条、实例账单、账户总账、余额、评估结论
+- 看调度摘要：现在几点（北京时间）、下次巡检 / 下次开机 / 下次日报分别是什么时候
+- 看状态机里记的东西：连续巡检失败次数、连续启动失败次数、待开机时刻、最近一次告警事件
+- 五个手动按钮：立即巡检、发日报、链路自检、权限探测、配置校验
+
+**刻意不做的事**
+
+- **没有开机按钮**。`mode=start` 不在看板白名单里，只能靠 cron 按 `start_at_minutes` 开机。
+  开机是花钱的动作，不给网页一个误触的机会。
+- **不自动轮询**。`/api/status` 一次要打 5 个子请求/实例，所以只在点「刷新」时跑。
+  页面上显示「采集于 …」，看的是那一刻的快照，不是实时流。
+- **不改任何东西**。看板只读 KV + 打阿里云查询接口，唯一的写操作是 `/api/run` 触发的
+  那几个 mode（它们本身也是巡检/日报，不改配置、不改实例状态）。
+
+**认证怎么做的**
+
+`DASHBOARD_USER` / `DASHBOARD_PASS` 存在 Worker Secret 里，登录成功后发一个签名 Cookie：
+
+```
+dash = <过期毫秒>.<HMAC-SHA256(DASHBOARD_PASS, "dash-v1:" + 过期毫秒)>
+```
+
+属性 `HttpOnly; Secure; SameSite=Strict; Path=/`，有效期 **180 天**。
+签名密钥就是密码本身——**改密码等于让所有已登录的浏览器立刻失效**，不用额外维护密钥。
+
+CSRF 靠两层：`SameSite=Strict` 让跨站请求带不上 Cookie，另外所有写操作都要求
+`X-Requested-With: dashboard` 头，浏览器跨站表单发不出自定义头。
+
+**路由一览**
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/` | 无（页面本身），数据要登录 | 看板 |
+| GET | `/health` | 无 | 三行纯文本，给脚本和探活用 |
+| POST | `/api/login` | 无 | 换 Cookie |
+| POST | `/api/logout` | 无 | 清 Cookie |
+| GET | `/api/summary` | Cookie 或 Bearer | 只读 KV，不花阿里云子请求 |
+| POST | `/api/status` | Cookie 或 Bearer | 打阿里云，5 子请求/实例 |
+| POST | `/api/run?mode=` | Cookie 或 Bearer | 只允许 monitor / report / selftest / ecs / config |
+| POST | `/run?mode=` | Bearer `MONITOR_SECRET` | 原来的接口，一字没改 |
+| POST | `/tg/<MONITOR_SECRET>` | 路径里的 secret | Telegram webhook，一字没改 |
+
+`/api/*` 同时接受 Cookie 和 `Authorization: Bearer <MONITOR_SECRET>`，所以脚本也能拉数据：
+
+```bash
+curl -s "$BASE/api/summary" -H "Authorization: Bearer $SECRET" | jq
+curl -s -X POST "$BASE/api/status" -H "Authorization: Bearer $SECRET" | jq
+```
+
+**安全上要知道的两件事**
+
+1. 看板走 HTTPS，但密码强度就是全部安全性——没有限速、没有锁定。
+   别用短密码，别和别处复用。
+2. Cookie 是 180 天的。在别人电脑上登录过，记得点「退出」，或者改一次 `DASHBOARD_PASS`
+   让全部会话作废。
+
 ### 为什么 KV 不在 wrangler.toml 里声明
 
 仓库是公开的，KV namespace ID 虽然不算密钥，但没必要进 Git。
@@ -197,7 +271,8 @@ curl -s -X POST "$BASE/run?mode=report"   -H "Authorization: Bearer $SECRET" | j
 ```
 .
 ├── src/
-│   ├── index.ts      Workers 入口：scheduled() / fetch() / Telegram webhook
+│   ├── index.ts      Workers 入口：scheduled() / fetch() / 看板路由 / Telegram webhook
+│   ├── dashboard.ts  网页看板：会话签名、cron 时刻推算、状态采集、整页 HTML
 │   ├── monitor.ts    止损与开机决策（runMonitor / runStart / Budget）
 │   ├── report.ts     日报、自检、权限探测
 │   ├── aliyun.ts     阿里云 RPC V1 客户端（HMAC-SHA1 签名 + ECS/CDT/BSS）
@@ -206,7 +281,7 @@ curl -s -X POST "$BASE/run?mode=report"   -H "Authorization: Bearer $SECRET" | j
 │   ├── scheduler.ts  一个 cron 分发三件事的纯函数
 │   ├── config.ts     配置结构、校验、凭证回落
 │   └── util.ts       北京时间、脱敏、百分号编码、消息切分
-├── test/             node:test 原生测试，84 个用例
+├── test/             node:test 原生测试，108 个用例
 ├── config.example.json
 ├── wrangler.toml
 └── package.json
@@ -227,11 +302,16 @@ npx wrangler tail
 
 ### 手动触发
 
+配了 `DASHBOARD_USER` / `DASHBOARD_PASS` 的话，直接开浏览器点按钮最省事（见上面「网页看板」）。
+
+命令行：
+
 ```bash
 curl -s -X POST "$BASE/run?mode=monitor" -H "Authorization: Bearer $SECRET"
 ```
 
 `mode` 可选 `monitor` / `start` / `report` / `selftest` / `ecs` / `config`。
+注意 `start`（开机）只有这个接口能调，看板刻意不给它入口。
 
 ### 状态文件
 
@@ -285,18 +365,19 @@ KV key `state/monitor_state.json`，是「实例 ID → 该实例状态」的平
 
 ```bash
 npm run typecheck   # tsc --noEmit，零错
-npm test            # 84 个用例
+npm test            # 108 个用例
 ```
 
 | 文件 | 用例 | 守什么 |
 | --- | --- | --- |
 | `util.test.ts` | 10 | 北京时间换算、百分号编码、base64、消息切分不丢字 |
-| `aliyun.test.ts` | 10 | RPC V1 签名与 Python 版算出的已知向量逐字对齐 |
+| `aliyun.test.ts` | 18 | RPC V1 签名与 Python 版算出的已知向量逐字对齐；`Items` 两种返回形状；公网 IP 三级回落 |
 | `scheduler.test.ts` | 12 | 分钟点分发、cron 与 schedule 自洽性校验 |
 | `monitor.test.ts` | 13 | 止损/开机五种情形、冷却、预算耗尽、连续失败告警 |
 | `state.test.ts` | 10 | 读失败拒写、内容没变不写、非法 JSON 兜底 |
 | `notify.test.ts` | 19 | 4xx 不算成功、Markdown 降级、分片、Bark 编码 |
 | `report.test.ts` | 10 | 评估优先级：超标 > 接近上限 > 扣费预警 > 正常 |
+| `dashboard.test.ts` | 16 | 会话伪造、Cookie 解析、下次巡检/开机/日报时刻推算、KV 摘要拼装 |
 
 `monitor.test.ts` 不打桩内部函数，而是换掉 `globalThis.fetch` ——
 从「查流量 → 判阈值 → 下发 ECS 命令 → 发告警 → 写状态」整条路都是真代码在跑。
@@ -337,6 +418,18 @@ npm test            # 84 个用例
 通常是 `load()` 失败过，此时 `save()` 主动拒写。
 如果日志里有 `没有 MONITOR_KV 绑定 —— 状态改用内存后端`，那是 KV 没绑上，
 每次调用内存都是空的，冷却时间戳存不住，同一条告警每 5 分钟重复一次。
+
+**访问 `/` 返回 503「看板未启用」**
+→ 没配 `DASHBOARD_USER` / `DASHBOARD_PASS`。这两个是 Worker **Secret**，
+配完要等新版本生效（Dashboard 改 Secret 会立刻生效，不用重新部署）。
+`/health` 和 `/run` 不受影响。
+
+**看板能打开但一直停在登录页**
+→ 登录成功但 Cookie 存不下。检查是不是用 `http://` 访问的（`Secure` Cookie 只在
+HTTPS 下保存），或者浏览器禁了 Cookie。`workers.dev` 域名默认就是 HTTPS。
+
+**看板登录后过一会儿又掉登录**
+→ 改过 `DASHBOARD_PASS`。签名密钥就是密码，改了密码所有旧 Cookie 立刻失效。
 
 ---
 

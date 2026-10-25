@@ -26,6 +26,19 @@ import { CRON, planFor, validateSchedule } from './scheduler.ts';
 import { sendTelegram } from './notify.ts';
 import { MemoryBackend, State, STATE_KEY, type StateBackend } from './state.ts';
 import { createLogger, redact, sanitizeMd, type Logger } from './util.ts';
+import {
+  SESSION_COOKIE,
+  SESSION_TTL_MS,
+  buildSummary,
+  clearCookie,
+  collectStatus,
+  dashboardHtml,
+  readCookie,
+  sessionCookie,
+  signSession,
+  timingSafeEqual,
+  verifySession,
+} from './dashboard.ts';
 
 export interface Env {
   /**
@@ -44,6 +57,10 @@ export interface Env {
   STATE_KEY?: string;
   /** 子请求预算覆盖，免费版别超过 45 */
   SUBREQUEST_BUDGET?: string;
+  /** 网页看板的登录用户名；不设则看板整体不可用（/health 与 /run 不受影响） */
+  DASHBOARD_USER?: string;
+  /** 网页看板的登录密码，同时充当 Cookie 的签名密钥 */
+  DASHBOARD_PASS?: string;
 }
 
 const CONFIG_KEY = 'config';
@@ -241,6 +258,67 @@ function authorized(request: Request, env: Env): boolean {
   return diff === 0;
 }
 
+// ---------- 看板：鉴权与响应包装 ----------
+
+const HTML_HEADERS = {
+  'Content-Type': 'text/html; charset=utf-8',
+  // 页面里没有外部资源，也没用 eval，直接全禁
+  'Content-Security-Policy':
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; " +
+    "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'",
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Cache-Control': 'no-store',
+};
+
+function html(body: string, status = 200, extra: Record<string, string> = {}): Response {
+  return new Response(body, { status, headers: { ...HTML_HEADERS, ...extra } });
+}
+
+/** 看板的账号密码，两个都要有才算配置好 */
+function dashCreds(env: Env): { user: string; pass: string } {
+  return {
+    user: (env.DASHBOARD_USER ?? '').trim(),
+    pass: (env.DASHBOARD_PASS ?? '').trim(),
+  };
+}
+
+/**
+ * /api/* 的鉴权：签名 Cookie 或 Bearer MONITOR_SECRET 都行。
+ *
+ * 接受 Bearer 是为了让脚本也能调这些接口 —— 比如定时用 curl 拉一份
+ * /api/status 存起来，不必去模拟登录拿 Cookie。
+ */
+async function dashboardAuthorized(request: Request, env: Env): Promise<boolean> {
+  const { pass } = dashCreds(env);
+  if (pass) {
+    const value = readCookie(request.headers.get('Cookie'), SESSION_COOKIE);
+    if (value && (await verifySession(pass, value, Date.now()))) return true;
+  }
+  return authorized(request, env);
+}
+
+/** 写操作要求带自定义头，跨站表单发不出这个头，配合 SameSite 挡 CSRF */
+function csrfOk(request: Request): boolean {
+  return (request.headers.get('X-Requested-With') ?? '').toLowerCase() === 'dashboard';
+}
+
+async function readJsonBody<T>(request: Request): Promise<T | null> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+const PUBLIC_MODES = ['monitor', 'report', 'selftest', 'ecs', 'config'] as const;
+type PublicMode = (typeof PUBLIC_MODES)[number];
+
+function isPublicMode(value: string): value is PublicMode {
+  return (PUBLIC_MODES as readonly string[]).includes(value);
+}
+
 export default {
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const outcome = await handleScheduled(event, env);
@@ -251,18 +329,122 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const log = createLogger('http');
+    const path = url.pathname;
 
-    // 健康检查，不需要鉴权
-    if (url.pathname === '/' && request.method === 'GET') {
+    // 健康检查（纯文本，给脚本和 uptime 探针用，不需要鉴权）
+    if (path === '/health' && request.method === 'GET') {
       return new Response(
         'aliyun-monitor on Cloudflare Workers\n\n' +
           'POST /run?mode=monitor|start|report|selftest|ecs|config\n' +
-          '需要 Authorization: Bearer <MONITOR_SECRET>\n',
+          '需要 Authorization: Bearer <MONITOR_SECRET>\n' +
+          '网页看板: /\n',
         { headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       );
     }
 
-    if (url.pathname === '/run') {
+    // 网页看板
+    if (path === '/' && request.method === 'GET') {
+      const { user, pass } = dashCreds(env);
+      if (!user || !pass) {
+        return html(
+          '<!doctype html><meta charset="utf-8"><title>看板未配置</title>' +
+            '<body style="font:15px/1.7 system-ui;padding:32px;max-width:560px;margin:0 auto">' +
+            '<h1 style="font-size:18px">看板还没配置账号</h1>' +
+            '<p>去 Cloudflare Dashboard → 这个 Worker → Settings → Variables and Secrets，' +
+            '加两个 <b>Secret</b>：</p>' +
+            '<pre style="background:#f4f4f5;padding:12px;border-radius:8px">DASHBOARD_USER = 你的用户名\n' +
+            'DASHBOARD_PASS = 你的密码</pre>' +
+            '<p>加完立刻生效，不用重新部署。<br>' +
+            '不想用看板也没关系：cron 巡检、止损、日报、Telegram 告警都不受影响，' +
+            '<code>/health</code> 和 <code>/run</code> 照常工作。</p>',
+          503,
+        );
+      }
+      return html(dashboardHtml());
+    }
+
+    if (path === '/api/login') {
+      if (request.method !== 'POST') return json({ error: '只接受 POST' }, 405);
+      const { user, pass } = dashCreds(env);
+      if (!user || !pass) return json({ error: '看板未配置 DASHBOARD_USER / DASHBOARD_PASS' }, 503);
+      const body = await readJsonBody<{ user?: string; pass?: string }>(request);
+      const givenUser = (body?.user ?? '').trim();
+      const givenPass = body?.pass ?? '';
+      // 两项都比较，且都用定长比较 —— 避免用耗时区分「用户名错」和「密码错」
+      const userOk = timingSafeEqual(givenUser, user);
+      const passOk = timingSafeEqual(givenPass, pass);
+      if (!userOk || !passOk) {
+        log.warn('看板登录失败');
+        return json({ error: '用户名或密码不对' }, 401);
+      }
+      const expiresAt = Date.now() + SESSION_TTL_MS;
+      const value = await signSession(pass, expiresAt);
+      log.info('看板登录成功');
+      return new Response(
+        JSON.stringify({ ok: true, expires_at: expiresAt }, null, 2),
+        {
+          status: 200,
+          headers: {
+            ...JSON_HEADERS,
+            'Set-Cookie': sessionCookie(value, SESSION_TTL_MS / 1000),
+            'Cache-Control': 'no-store',
+          },
+        },
+      );
+    }
+
+    if (path === '/api/logout') {
+      if (request.method !== 'POST') return json({ error: '只接受 POST' }, 405);
+      return new Response(JSON.stringify({ ok: true }, null, 2), {
+        status: 200,
+        headers: { ...JSON_HEADERS, 'Set-Cookie': clearCookie() },
+      });
+    }
+
+    if (path === '/api/summary') {
+      if (request.method !== 'GET') return json({ error: '只接受 GET' }, 405);
+      if (!(await dashboardAuthorized(request, env))) return json({ error: '未登录' }, 401);
+      try {
+        const { ctx } = await makeContext({ env, log });
+        return json(buildSummary(ctx.config, ctx.state, ctx.now()));
+      } catch (error) {
+        log.error('摘要读取失败:', redact(error));
+        return json({ error: redact(error) }, 500);
+      }
+    }
+
+    if (path === '/api/status') {
+      if (request.method !== 'POST') return json({ error: '只接受 POST' }, 405);
+      if (!(await dashboardAuthorized(request, env))) return json({ error: '未登录' }, 401);
+      if (!csrfOk(request)) return json({ error: '缺少 X-Requested-With' }, 403);
+      try {
+        const { ctx } = await makeContext({ env, log });
+        return json(await collectStatus(ctx));
+      } catch (error) {
+        log.error('状态采集失败:', redact(error));
+        return json({ error: redact(error) }, 500);
+      }
+    }
+
+    if (path === '/api/run') {
+      if (request.method !== 'POST') return json({ error: '只接受 POST' }, 405);
+      if (!(await dashboardAuthorized(request, env))) return json({ error: '未登录' }, 401);
+      if (!csrfOk(request)) return json({ error: '缺少 X-Requested-With' }, 403);
+      const mode = (url.searchParams.get('mode') ?? '').trim();
+      // 看板刻意不开放 mode=start：开机是唯一会改变计费状态的操作，
+      // 保留给 curl + Bearer，逼人多想一秒。
+      if (!isPublicMode(mode)) {
+        return json({ error: `看板不支持 mode=${mode || '(空)'}` }, 400);
+      }
+      try {
+        return json(await handleMode(mode, env));
+      } catch (error) {
+        log.error(`看板 ${mode} 失败:`, redact(error));
+        return json({ error: redact(error) }, 500);
+      }
+    }
+
+    if (path === '/run') {
       if (request.method !== 'POST') return json({ error: '只接受 POST' }, 405);
       if (!authorized(request, env)) return json({ error: '鉴权失败' }, 401);
       const mode = (url.searchParams.get('mode') ?? 'monitor').trim();
@@ -276,9 +458,9 @@ export default {
     }
 
     // Telegram webhook：路径里带 token 前缀当共享密钥
-    if (url.pathname.startsWith('/tg/')) {
+    if (path.startsWith('/tg/')) {
       const secret = (env.MONITOR_SECRET ?? '').trim();
-      if (!secret || url.pathname !== `/tg/${secret}`) return json({ error: 'not found' }, 404);
+      if (!secret || path !== `/tg/${secret}`) return json({ error: 'not found' }, 404);
       if (request.method !== 'POST') return json({ error: '只接受 POST' }, 405);
       try {
         return json(await handleTelegramUpdate(request, env, log));
