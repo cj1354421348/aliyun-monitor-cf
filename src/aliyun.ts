@@ -243,11 +243,43 @@ export async function fetchTrafficGb(
 export interface InstanceInfo {
   Status?: string;
   InstanceType?: string;
+  /** vCPU 个数 */
   Cpu?: number;
+  /** 内存，单位 MiB（阿里云文档：Memory | integer | 内存大小，单位为 MiB） */
   Memory?: number;
+  /** 分配的公网 IP。VPC 实例绑了 EIP 时这里可能是空数组 */
   PublicIpAddress?: { IpAddress?: string[] };
+  /** 绑定的弹性公网 IP。EIP 实例的真实公网地址在这里 */
+  EipAddress?: { IpAddress?: string; AllocationId?: string };
+  /** 经典网络内网 IP */
   InnerIpAddress?: { IpAddress?: string[] };
+  /** 弹性网卡。VPC 实例的主私网 IP 在 NetworkInterfaces.NetworkInterface[].PrimaryIpAddress */
+  NetworkInterfaces?: {
+    NetworkInterface?: Array<{
+      PrimaryIpAddress?: string;
+      PrivateIpSets?: { PrivateIpSet?: Array<{ PrivateIpAddress?: string }> };
+    }>;
+  };
   [key: string]: unknown;
+}
+
+/**
+ * 实例的公网 IP。按可信度依次回落：
+ * PublicIpAddress（经典/VPC 直挂） → EipAddress（绑了 EIP） → 网卡主 IP。
+ * 全都没有就返回 null —— 内网 IP 不算，日报里显示内网地址会误导止损判断。
+ */
+export function publicIpOf(instance: InstanceInfo | null): string | null {
+  if (!instance) return null;
+  const direct = instance.PublicIpAddress?.IpAddress ?? [];
+  if (direct.length && direct[0]) return direct[0];
+  const eip = (instance.EipAddress?.IpAddress ?? '').trim();
+  if (eip) return eip;
+  const nics = instance.NetworkInterfaces?.NetworkInterface ?? [];
+  for (const nic of nics) {
+    const primary = (nic.PrimaryIpAddress ?? '').trim();
+    if (primary) return primary;
+  }
+  return null;
 }
 
 function ecsParams(user: { region: string; resgroup?: string }): Params {
@@ -355,6 +387,23 @@ interface BillItem {
 }
 
 /**
+ * 账单接口的 Items 有两种形状，别混：
+ *   DescribeInstanceBill → Data.Items 是数组
+ *   QueryBillOverview    → Data.Items 是对象，里面才是 Item 数组
+ * 直接把 Items 当数组取 [0]，QueryBillOverview 永远拿到 undefined，
+ * 表现就是"账户总账: Fail"。
+ */
+export function billItems(data: { Items?: unknown } | undefined | null): BillItem[] {
+  const items = data?.Items;
+  if (!items) return [];
+  if (Array.isArray(items)) return items as BillItem[];
+  const nested = (items as { Item?: unknown }).Item;
+  if (Array.isArray(nested)) return nested as BillItem[];
+  if (nested) return [nested as BillItem];
+  return [];
+}
+
+/**
  * 本月账单。先按实例查，查不到再退到账号总览。
  *
  * QueryBillOverview 是账号级的，不是实例级，数字会明显偏大，
@@ -368,7 +417,7 @@ export async function fetchBill(
   options: { log?: Logger } = {},
 ): Promise<BillResult> {
   for (const endpoint of bssEndpoints(user)) {
-    const data = await bssCall<{ Success?: boolean; Data?: { Items?: BillItem[] } }>(
+    const data = await bssCall<{ Success?: boolean; Data?: { Items?: unknown } }>(
       creds,
       endpoint,
       'DescribeInstanceBill',
@@ -376,7 +425,7 @@ export async function fetchBill(
       options.log,
     );
     if (!data?.Success) continue;
-    const items = data.Data?.Items ?? [];
+    const items = billItems(data.Data);
     const first = items[0];
     if (!first) continue;
     const amount = items.reduce((sum, item) => sum + num(item.PretaxAmount), 0);
@@ -384,7 +433,7 @@ export async function fetchBill(
   }
 
   for (const endpoint of bssEndpoints(user)) {
-    const data = await bssCall<{ Success?: boolean; Data?: { Items?: BillItem[] } }>(
+    const data = await bssCall<{ Success?: boolean; Data?: { Items?: unknown } }>(
       creds,
       endpoint,
       'QueryBillOverview',
@@ -392,11 +441,12 @@ export async function fetchBill(
       options.log,
     );
     if (!data?.Success) continue;
-    const items = data.Data?.Items ?? [];
+    const items = billItems(data.Data);
     const first = items[0];
     if (!first) continue;
+    const amount = items.reduce((sum, item) => sum + num(item.PretaxAmount), 0);
     return {
-      amount: num(first.PretaxAmount),
+      amount,
       currency: first.Currency ?? '',
       scope: '账号总览',
     };
@@ -418,7 +468,7 @@ export async function fetchAccountBill(
   options: { log?: Logger } = {},
 ): Promise<BalanceResult> {
   for (const endpoint of bssEndpoints(user)) {
-    const data = await bssCall<{ Success?: boolean; Data?: { Items?: BillItem[] } }>(
+    const data = await bssCall<{ Success?: boolean; Data?: { Items?: unknown } }>(
       creds,
       endpoint,
       'QueryBillOverview',
@@ -426,9 +476,13 @@ export async function fetchAccountBill(
       options.log,
     );
     if (!data?.Success) continue;
-    const first = (data.Data?.Items ?? [])[0];
-    if (!first) continue;
-    return { amount: num(first.PretaxAmount), currency: first.Currency ?? '' };
+    const items = billItems(data.Data);
+    const first = items[0];
+    // 站点对了但本期没有账单（新账号/零消费）：再打另一个站点只会拿到
+    // NotApplicable 的假错误，日志里看着像出事了，其实不是。
+    if (!first) return { amount: 0, currency: '' };
+    const amount = items.reduce((sum, item) => sum + num(item.PretaxAmount), 0);
+    return { amount, currency: first.Currency ?? '' };
   }
   return { amount: null, currency: '' };
 }

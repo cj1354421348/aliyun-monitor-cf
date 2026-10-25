@@ -16,6 +16,7 @@ import {
   fetchBill,
   fetchTrafficGb,
   probeBill,
+  publicIpOf,
   queryBalance,
   type Credentials,
 } from './aliyun.ts';
@@ -57,11 +58,16 @@ export function evaluate(
   return '✅';
 }
 
-/** 内存按 GB 展示：整 GB 不显示小数，避免出现 "4.0 GB" 这种别扭写法 */
+/**
+ * 内存按 GB 展示。DescribeInstances 返回的 Memory 单位是 MiB（不是 MB 也不是 GB），
+ * 必须先除 1024；直接把 512 当 GB 会渲染成 "2C512G"。
+ * 整 GB 不显示小数，避免出现 "4.0 GB" 这种别扭写法。
+ */
 function formatMemoryGb(memory: unknown): string {
-  const value = num(memory);
-  if (!value) return '-';
-  return value % 1 === 0 ? String(value) : value.toFixed(1);
+  const mib = num(memory);
+  if (!mib) return '-';
+  const gb = mib / 1024;
+  return gb % 1 === 0 ? String(gb) : gb.toFixed(1);
 }
 
 /** 货币符号：认识的用符号，不认识的退回 "0.44 USD" */
@@ -182,8 +188,9 @@ async function buildUserReport(
   );
 
   if (instance) {
-    const addresses = instance.PublicIpAddress?.IpAddress ?? instance.InnerIpAddress?.IpAddress ?? [];
-    lines.push(`   🌐 IP: ${addresses[0] ?? '-'}`);
+    // 公网 IP 有三个来源，顺序在 publicIpOf 里定好了；内网 IP 不往这儿放，
+    // 否则止损判断时容易把内网地址当公网。
+    lines.push(`   🌐 IP: ${publicIpOf(instance) ?? '-'}`);
   }
 
   if (trafficNote) {
